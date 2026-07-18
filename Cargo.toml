@@ -1,0 +1,12 @@
+[package]
+name = "heavyengine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# We will use rand to initialize our weights with random numbers
+rand = "0.8"
+
+[build-dependencies]
+# cc compiles CUDA source files into static libraries linked into Rust
+cc = { version = "1.0", features = ["parallel"] }
