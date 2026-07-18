@@ -19,7 +19,6 @@ __global__ void matmul_forward_kernel(
     // Make sure the thread is within matrix boundaries
     if (row < batch && col < out_dim) {
         float sum = b[col];
-        printf("in_dim:%d\n" ,in_dim); // Start with the bias value for this output neuron
         for (int i = 0; i < in_dim; i++) {
             // Dot product: Row of x * Column of w
             sum += x[row * in_dim + i] * w[i * out_dim + col];
@@ -134,6 +133,122 @@ __global__ void sgd_step_kernel(
     }
 }
 
+__global__ void layernorm_forward_kernel(
+    float* out,
+    float* cache_mean,
+    float* cache_var,
+    const float* inp,
+    const float* gamma,
+    const float* beta,
+    int batch,
+    int dim,
+    float eps
+){
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(b < batch){
+        const float* x = inp + b * dim;
+        float* y = out +b * dim;
+
+        // 1. Calculate the Average (Mean) of this row
+        float sum = 0;
+        for(int i = 0;i < dim;i++){
+            sum += x[i];
+        }
+        float mean = sum/dim;
+
+        // 2. Calculate the Variance (How spread out the numbers are)
+        float var_sum = 0.0f;
+        for(int i = 0; i < dim;i++){
+            float diff = x[i] - mean;
+            var_sum += diff*diff;
+        }
+        float var = var_sum / dim ; 
+
+        // Save these so Backprop can use them later!
+        cache_mean[b] = mean;
+        cache_var[b] = var;
+
+        // rsqrtf is a hardware command for "1.0 / sqrt(x)"
+        float inv_std = rsqrtf(var + eps);
+
+        // 3. Normalize the row, then multiply by Gamma and add Beta
+        for (int i = 0; i < dim; i++) {
+            float x_hat = (x[i] - mean) * inv_std;
+            y[i] = gamma[i] * x_hat + beta[i];
+        }
+        
+    }
+}
+
+// 9. CUDA Kernel for LayerNorm Backward
+__global__ void layernorm_backward_kernel(
+    float* dinp, float* dgamma, float* dbeta,
+    const float* dout, const float* inp, const float* cache_mean, const float* cache_var,
+    const float* gamma, int batch, int dim, float eps
+){
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (b < batch) {
+        const float* x = inp + b * dim;
+        const float* dy = dout + b * dim;
+        float* dx = dinp + b * dim;
+        
+        float mean = cache_mean[b];
+        float var = cache_var[b];
+        float inv_std = rsqrtf(var + eps);
+        
+        float sum_dy_gamma = 0.0f;
+        float sum_dy_gamma_xhat = 0.0f;
+        
+        for (int i = 0; i < dim; i++) {
+            float dy_g = dy[i] * gamma[i];
+            float x_hat = (x[i] - mean) * inv_std;
+            sum_dy_gamma += dy_g;
+            sum_dy_gamma_xhat += dy_g * x_hat;
+            
+            // atomicAdd safely adds the blame scores together across all batch threads!
+            atomicAdd(&dgamma[i], dy[i] * x_hat);
+            atomicAdd(&dbeta[i], dy[i]);
+        }
+        
+        // Calculate the blame score for the original inputs
+        for (int i = 0; i < dim; i++) {
+            float dy_g = dy[i] * gamma[i];
+            float x_hat = (x[i] - mean) * inv_std;
+            dx[i] = inv_std * (dy_g - (sum_dy_gamma / dim) - x_hat * (sum_dy_gamma_xhat / dim));
+        }
+    }
+}
+// 10. CUDA Kernel for AdamW Optimizer Step
+__global__ void adamw_step_kernel(
+    float* param, float* m, float* v, const float* grad,
+    float lr, float beta1, float beta2, float eps, float weight_decay,
+    int step, int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < size) {
+        float g = grad[idx]; // The raw blame score
+        
+        // 1. Apply a tiny bit of friction (Weight Decay)
+        param[idx] -= lr * weight_decay * param[idx];
+        
+        // 2. Update our history of Momentum (m) and Velocity (v)
+        float mt = beta1 * m[idx] + (1.0f - beta1) * g;
+        float vt = beta2 * v[idx] + (1.0f - beta2) * g * g;
+        m[idx] = mt;
+        v[idx] = vt;
+        
+        // 3. Math trick to fix the history during the very first few steps
+        float m_hat = mt / (1.0f - powf(beta1, step));
+        float v_hat = vt / (1.0f - powf(beta2, step));
+        
+        // 4. Finally, update the actual weight using the history!
+        param[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
+    }
+}
+
 // ==========================================
 // 2. FFI LAUNCH WRAPPERS (C LINKAGE)
 // ==========================================
@@ -222,5 +337,43 @@ void launch_sgd_step(float* param, const float* grad, float lr, int size) {
     int grid = (size + block - 1) / block;
     sgd_step_kernel<<<grid, block>>>(param, grad, lr, size);
     cudaDeviceSynchronize();
+}
+
+// Launcher for LayerNorm Forward
+void launch_layernorm_forward(
+    float* out, float* cache_mean, float* cache_var,
+    const float* inp, const float* gamma, const float* beta,
+    int batch, int dim, float eps
+) {
+    int block = 256;
+    int grid = (batch + block - 1) / block;
+    layernorm_forward_kernel<<<grid, block>>>(out, cache_mean, cache_var, inp, gamma, beta, batch, dim, eps);
+    cudaDeviceSynchronize();
+}
+// Launcher for LayerNorm Backward
+void launch_layernorm_backward(
+    float* dinp, float* dgamma, float* dbeta,
+    const float* dout, const float* inp, const float* cache_mean, const float* cache_var,
+    const float* gamma, int batch, int dim, float eps
+) {
+    int block = 256;
+    int grid = (batch + block - 1) / block;
+    layernorm_backward_kernel<<<grid, block>>>(dinp, dgamma, dbeta, dout, inp, cache_mean, cache_var, gamma, batch, dim, eps);
+    cudaDeviceSynchronize();
+}
+// Launcher for AdamW Step
+void launch_adamw_step(
+    float* param, float* m, float* v, const float* grad,
+    float lr, float beta1, float beta2, float eps, float weight_decay,
+    int step, int size
+) {
+    int block = 256;
+    int grid = (size + block - 1) / block;
+    adamw_step_kernel<<<grid, block>>>(param, m, v, grad, lr, beta1, beta2, eps, weight_decay, step, size);
+    cudaDeviceSynchronize();
+}
+// Helper function to wipe memory to 0.0 before atomicAdd
+void gpu_memset(void* device_ptr, int value, size_t size) {
+    cudaMemset(device_ptr, value, size);
 }
 } // extern "C"

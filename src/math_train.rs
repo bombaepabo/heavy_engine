@@ -117,6 +117,29 @@ unsafe extern "C"{
     pub fn launch_relu_forward(out: *mut f32, inp: *const f32, size: i32);
     pub fn launch_relu_backward(dinp: *mut f32, dout: *const f32, inp: *const f32, size: i32);
     pub fn launch_sgd_step(param: *mut f32, grad: *const f32, lr: f32, size: i32);
+
+ // Phase 2: LayerNorm & AdamW Wrappers
+    pub fn launch_layernorm_forward(
+        out: *mut f32, cache_mean: *mut f32, cache_var: *mut f32,
+        inp: *const f32, gamma: *const f32, beta: *const f32,
+        batch: i32, dim: i32, eps: f32,
+    );
+    pub fn launch_layernorm_backward(
+        dinp: *mut f32, dgamma: *mut f32, dbeta: *mut f32,
+        dout: *const f32, inp: *const f32, cache_mean: *const f32, cache_var: *const f32,
+        gamma: *const f32, batch: i32, dim: i32, eps: f32,
+    );
+    pub fn launch_adamw_step(
+        param: *mut f32, m: *mut f32, v: *mut f32, grad: *const f32,
+        lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32,
+        step: i32, size: i32,
+    );
+    
+    // Phase 2: Helper to zero out memory arrays on the GPU
+    pub fn gpu_memset(device_ptr: *mut c_void, value: i32, size: usize);
+
+
+
 }
 
 // ==========================================
@@ -162,6 +185,14 @@ impl GPUMemory {
                 self.ptr as *const c_void,
                 byte_size,
             );
+        }
+    }
+
+    // Zero out the VRAM (used to wipe gradients before Backprop atomicAdd)
+    pub fn zero_memory(&self) {
+        let byte_size = self.size * std::mem::size_of::<f32>();
+        unsafe {
+            gpu_memset(self.ptr as *mut c_void, 0, byte_size);
         }
     }
 }

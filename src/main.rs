@@ -2,7 +2,7 @@ pub mod math_train;
 pub mod mlp;
 
 use math_train::GPUMemory;
-use mlp::MLP;
+use crate::mlp::{MLP, AdamW};
 
 fn main() {
     println!("Initializing heavyengine Training Pipeline...");
@@ -24,6 +24,9 @@ fn main() {
 
     let model = MLP::new(batch_size, input_dim, hidden_dim, output_dim);
     model.initialize_parameters();
+    
+    // Initialize AdamW optimizer state (Wiping memory to 0.0)
+    let mut optimizer = AdamW::new(input_dim, hidden_dim, output_dim);
 
     // 3. Upload XOR inputs to the GPU (we keep them there since they don't change)
     let gpu_inputs = GPUMemory::new(xor_inputs.len());
@@ -31,7 +34,7 @@ fn main() {
 
     // Hyperparameters
     let epochs = 2000;
-    let learning_rate = 0.5;
+    let learning_rate = 0.01;
 
     println!("Starting training for {} epochs...", epochs);
 
@@ -78,8 +81,9 @@ fn main() {
         // Step C: Backward Pass on GPU (computes dW2, dB2, dA1, dZ1, dW1, dB1)
         model.backward(&gpu_inputs);
 
-        // Step D: Update model weights and biases using SGD on GPU
-        model.update_parameters(learning_rate);
+        // Step D: Update model weights and biases using AdamW
+        optimizer.step(&model, learning_rate);
+
 
         // Print loss every 200 epochs
         if epoch % 200 == 0 || epoch == 1 {
