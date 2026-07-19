@@ -138,8 +138,25 @@ unsafe extern "C"{
     // Phase 2: Helper to zero out memory arrays on the GPU
     pub fn gpu_memset(device_ptr: *mut c_void, value: i32, size: usize);
 
+    pub fn rnn_forward_kernel(
+        x_embed: *const f32,
+        h_prev: *const f32,
+        w_xh: *const f32,
+        w_hh: *const f32,
+        b_h: *const f32,
+        h_next: *mut f32,
+        batch_size: std::os::raw::c_int,
+        embed_dim: std::os::raw::c_int,
+        hidden_dim: std::os::raw::c_int,
+    );
 
-
+    pub fn rnn_tanh_derivative_kernel(
+        dh: *const f32,
+        h_t: *const f32,
+        dh_raw: *mut f32,
+        batch_size: std::os::raw::c_int,
+        hidden_dim: std::os::raw::c_int,
+    );
 }
 
 // ==========================================

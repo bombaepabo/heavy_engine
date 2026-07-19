@@ -1,6 +1,39 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
+// The Core RNN Memory Engine
+extern "C" __global__ void rnn_forward_kernel(
+    const float* x_embed, // The current letter (as a math vector)
+    const float* h_prev,  // The AI's previous memory
+    const float* w_xh,    // Weights for the letter
+    const float* w_hh,    // Weights for the memory
+    const float* b_h,     // Bias
+    float* h_next,        // The NEW memory we are calculating
+    int batch_size,
+    int embed_dim,
+    int hidden_dim
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // Which text sequence are we on?
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // Which memory cell are we calculating?
+    
+    if (row < batch_size && col < hidden_dim) {
+        float sum = b_h[col];
+        
+        // 1. Multiply the Current Letter by its weights
+        for (int k = 0; k < embed_dim; ++k) {
+            sum += x_embed[row * embed_dim + k] * w_xh[k * hidden_dim + col];
+        }
+        
+        // 2. Multiply the Past Memory by its weights (THIS IS THE MAGIC!)
+        for (int k = 0; k < hidden_dim; ++k) {
+            sum += h_prev[row * hidden_dim + k] * w_hh[k * hidden_dim + col];
+        }
+        
+        // 3. Apply Tanh Activation (Squishes the new memory safely between -1.0 and 1.0)
+        h_next[row * hidden_dim + col] = tanhf(sum);
+    }
+}
+
 // 1. CUDA Kernel for MatMul Forward Pass: out = x * w + b
 // Grid dimensions will map threads to: row (batch), col (out_dim)
 __global__ void matmul_forward_kernel(
@@ -376,4 +409,27 @@ void launch_adamw_step(
 void gpu_memset(void* device_ptr, int value, size_t size) {
     cudaMemset(device_ptr, value, size);
 }
-} // extern "C"
+}// extern "C"
+
+// BPTT: Calculates the raw blame score by taking the derivative of Tanh
+extern "C" __global__ void rnn_tanh_derivative_kernel(
+    const float* dh,        // The Blame Score passed backward from the future
+    const float* h_t,       // The snapshot of the AI's memory at this exact point in time
+    float* dh_raw,          // The final Blame Score after Calculus
+    int batch_size,
+    int hidden_dim
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < batch_size && col < hidden_dim) {
+        int idx = row * hidden_dim + col;
+        
+        // Calculus! The derivative of Tanh is: 1.0 - (h * h)
+        float h_val = h_t[idx];
+        float derivative = 1.0f - (h_val * h_val);
+        
+        // Multiply the incoming blame by the derivative!
+        dh_raw[idx] = dh[idx] * derivative;
+    }
+}
