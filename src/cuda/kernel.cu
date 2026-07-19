@@ -1,6 +1,13 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
+#define checkCudaError(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line) {
+    if (code != cudaSuccess) {
+        printf("GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+    }
+}
+
 // The Core RNN Memory Engine
 extern "C" __global__ void rnn_forward_kernel(
     const float* x_embed, // The current letter (as a math vector)
@@ -51,7 +58,7 @@ __global__ void matmul_forward_kernel(
 
     // Make sure the thread is within matrix boundaries
     if (row < batch && col < out_dim) {
-        float sum = b[col];
+        float sum = (b != nullptr) ? b[col] : 0.0f;
         for (int i = 0; i < in_dim; i++) {
             // Dot product: Row of x * Column of w
             sum += x[row * in_dim + i] * w[i * out_dim + col];
@@ -318,7 +325,7 @@ void launch_matmul_forward(
     // Calculate the number of blocks needed in the grid to cover all output cells
     dim3 grid((out_dim + block.x - 1) / block.x, (batch + block.y - 1) / block.y);
     matmul_forward_kernel<<<grid, block>>>(out, x, w, b, batch, in_dim, out_dim);
-    cudaDeviceSynchronize(); // Ensure execution finishes before returning to Rust
+    checkCudaError(cudaDeviceSynchronize()); // Ensure execution finishes before returning to Rust
 }
 // Launcher for MatMul Backward Weight
 void launch_matmul_backward_weight(
@@ -328,7 +335,7 @@ void launch_matmul_backward_weight(
     dim3 block(16, 16);
     dim3 grid((out_dim + block.x - 1) / block.x, (in_dim + block.y - 1) / block.y);
     matmul_backward_weight_kernel<<<grid, block>>>(dw, x, dz, batch, in_dim, out_dim);
-    cudaDeviceSynchronize();
+    checkCudaError(cudaDeviceSynchronize());
 }
 // Launcher for MatMul Backward Bias
 void launch_matmul_backward_bias(
@@ -338,7 +345,7 @@ void launch_matmul_backward_bias(
     int block = 256;
     int grid = (out_dim + block - 1) / block;
     matmul_backward_bias_kernel<<<grid, block>>>(db, dz, batch, out_dim);
-    cudaDeviceSynchronize();
+    checkCudaError(cudaDeviceSynchronize());
 }
 // Launcher for MatMul Backward Input
 void launch_matmul_backward_input(
@@ -348,7 +355,7 @@ void launch_matmul_backward_input(
     dim3 block(16, 16);
     dim3 grid((in_dim + block.x - 1) / block.x, (batch + block.y - 1) / block.y);
     matmul_backward_input_kernel<<<grid, block>>>(dx, dz, w, batch, in_dim, out_dim);
-    cudaDeviceSynchronize();
+    checkCudaError(cudaDeviceSynchronize());
 }
 // Launcher for ReLU Forward
 void launch_relu_forward(float* out, const float* inp, int size) {
@@ -431,5 +438,208 @@ extern "C" __global__ void rnn_tanh_derivative_kernel(
         
         // Multiply the incoming blame by the derivative!
         dh_raw[idx] = dh[idx] * derivative;
+    }
+}
+// Phase 4: Google's Self-Attention Equation
+extern "C" __global__ void attention_forward_kernel(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* Output,
+    int seq_len,
+    int embed_dim
+) {
+    // Which letter in the sentence are we calculating? (e.g. Letter 0 to 24)
+    int row = blockIdx.x * blockDim.x + threadIdx.x; 
+    
+    if (row < seq_len) {
+        
+        // 1. Calculate Q * K (How much do I care about the other letters?)
+        float scores[256]; 
+        float max_score = -1e9f;
+        
+        for (int i = 0; i < seq_len; ++i) {
+            if (i > row) {
+                scores[i] = -1e9f;
+                continue;
+            }
+            float sum = 0.0f;
+            for (int d = 0; d < embed_dim; ++d) {
+                sum += Q[row * embed_dim + d] * K[i * embed_dim + d]; // Q * K
+            }
+            // Scale it down so it doesn't explode (sqrt of 64 is 8.0)
+            sum = sum / 8.0f; 
+            scores[i] = sum;
+            if (sum > max_score) max_score = sum;
+        }
+        
+        // 2. Softmax (Turn the raw scores into percentages that add up to 100%)
+        float sum_exp = 0.0f;
+        for (int i = 0; i < seq_len; ++i) {
+            scores[i] = expf(scores[i] - max_score);
+            sum_exp += scores[i];
+        }
+        for (int i = 0; i < seq_len; ++i) {
+            scores[i] /= sum_exp;
+        }
+        
+        // 3. Absorb the Value (V) based on the percentages!
+        for (int d = 0; d < embed_dim; ++d) {
+            float out_sum = 0.0f;
+            for (int i = 0; i < seq_len; ++i) {
+                out_sum += scores[i] * V[i * embed_dim + d]; // Percentages * V
+            }
+            Output[row * embed_dim + d] = out_sum;
+        }
+    }
+}
+// Phase 4.5: The Attention Backward Pass
+// Cross Entropy Loss & Gradients for Language Model
+extern "C" __global__ void cross_entropy_kernel(
+    const float* logits,
+    const int* targets,
+    float* dlogits,
+    float* loss_out,
+    int seq_len,
+    int vocab_size
+) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t < seq_len) {
+        int target = targets[t];
+        const float* logit_row = logits + t * vocab_size;
+        float* dlogit_row = dlogits + t * vocab_size;
+        
+        float max_val = -1e9f;
+        for (int v = 0; v < vocab_size; ++v) {
+            if (logit_row[v] > max_val) max_val = logit_row[v];
+        }
+        
+        float sum_exp = 0.0f;
+        for (int v = 0; v < vocab_size; ++v) {
+            sum_exp += expf(logit_row[v] - max_val);
+        }
+        
+        if (target >= 0 && target < vocab_size) {
+            float p_target = expf(logit_row[target] - max_val) / sum_exp;
+            float loss = -logf(fmaxf(p_target, 1e-7f));
+            atomicAdd(loss_out, loss / (float)seq_len);
+        }
+        
+        for (int v = 0; v < vocab_size; ++v) {
+            float p_i = expf(logit_row[v] - max_val) / sum_exp;
+            float target_i = (v == target) ? 1.0f : 0.0f;
+            dlogit_row[v] = (p_i - target_i) / (float)seq_len;
+        }
+    }
+}
+// Exact Self-Attention Backward Pass (dQ, dK, dV)
+extern "C" __global__ void attention_backward_kernel(
+    const float* dOutput, 
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* dQ,
+    float* dK,
+    float* dV,
+    int seq_len,
+    int embed_dim
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x; 
+    
+    if (row < seq_len) {
+        float scores[256];
+        float max_score = -1e9f;
+        for (int i = 0; i < seq_len; ++i) {
+            if (i > row) {
+                scores[i] = -1e9f;
+                continue;
+            }
+            float sum = 0.0f;
+            for (int d = 0; d < embed_dim; ++d) {
+                sum += Q[row * embed_dim + d] * K[i * embed_dim + d];
+            }
+            sum = sum / 8.0f;
+            scores[i] = sum;
+            if (sum > max_score) max_score = sum;
+        }
+        
+        float sum_exp = 0.0f;
+        for (int i = 0; i < seq_len; ++i) {
+            scores[i] = expf(scores[i] - max_score);
+            sum_exp += scores[i];
+        }
+        for (int i = 0; i < seq_len; ++i) {
+            scores[i] /= sum_exp;
+        }
+        // dV = P^T * dOutput
+        for (int i = 0; i < seq_len; ++i) {
+            for (int d = 0; d < embed_dim; ++d) {
+                atomicAdd(&dV[i * embed_dim + d], scores[i] * dOutput[row * embed_dim + d]);
+            }
+        }
+        
+        // dP = dOutput * V^T
+        float dP[256];
+        float sum_dP_P = 0.0f;
+        for (int i = 0; i < seq_len; ++i) {
+            float dp_sum = 0.0f;
+            for (int d = 0; d < embed_dim; ++d) {
+                dp_sum += dOutput[row * embed_dim + d] * V[i * embed_dim + d];
+            }
+            dP[i] = dp_sum;
+            sum_dP_P += dp_sum * scores[i];
+        }
+        // dS = P * (dP - sum(dP * P)) / sqrt(d)
+        for (int i = 0; i < seq_len; ++i) {
+            float dS = scores[i] * (dP[i] - sum_dP_P) / 8.0f;
+            for (int d = 0; d < embed_dim; ++d) {
+                atomicAdd(&dQ[row * embed_dim + d], dS * K[i * embed_dim + d]);
+                atomicAdd(&dK[i * embed_dim + d], dS * Q[row * embed_dim + d]);
+            }
+        }
+    }
+}
+
+extern "C" {
+    void launch_attention_forward(const float* Q, const float* K, const float* V, float* Output, int seq_len, int embed_dim) {
+        int block = 256;
+        int grid = (seq_len + block - 1) / block;
+        attention_forward_kernel<<<grid, block>>>(Q, K, V, Output, seq_len, embed_dim);
+        checkCudaError(cudaDeviceSynchronize());
+    }
+    
+    void launch_cross_entropy(const float* logits, const int* targets, float* dlogits, float* loss_out, int seq_len, int vocab_size) {
+        int block = 256;
+        int grid = (seq_len + block - 1) / block;
+        cross_entropy_kernel<<<grid, block>>>(logits, targets, dlogits, loss_out, seq_len, vocab_size);
+        checkCudaError(cudaDeviceSynchronize());
+    }
+    
+    void launch_attention_backward(const float* dOutput, const float* Q, const float* K, const float* V, float* dQ, float* dK, float* dV, int seq_len, int embed_dim) {
+        int block = 256;
+        int grid = (seq_len + block - 1) / block;
+        attention_backward_kernel<<<grid, block>>>(dOutput, Q, K, V, dQ, dK, dV, seq_len, embed_dim);
+        checkCudaError(cudaDeviceSynchronize());
+    }
+}
+
+// 9. CUDA Kernel for In-Place Addition (Residual Connections)
+__global__ void add_inplace_kernel(
+    float* dest,
+    const float* src,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        dest[idx] += src[idx];
+    }
+}
+
+extern "C" {
+    void launch_add_inplace(float* dest, const float* src, int size) {
+        int block = 256;
+        int grid = (size + block - 1) / block;
+        add_inplace_kernel<<<grid, block>>>(dest, src, size);
+        checkCudaError(cudaDeviceSynchronize());
     }
 }

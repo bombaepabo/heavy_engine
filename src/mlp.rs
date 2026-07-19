@@ -60,6 +60,9 @@ impl AdamW {
 }
 
 pub struct MLP {
+
+    pub _pool: GPUMemory,
+
     // Phase 1 Parameters
     pub w1: GPUMemory, pub b1: GPUMemory,
     pub w2: GPUMemory, pub b2: GPUMemory,
@@ -94,30 +97,44 @@ pub struct MLP {
 }
 impl MLP {
     pub fn new(batch_size: usize, input_dim: usize, hidden_dim: usize, output_dim: usize) -> Self {
+        // Calculate the exact size of all 23 matrices combined
+        let s_w1 = input_dim * hidden_dim;   let s_b1 = hidden_dim;
+        let s_w2 = hidden_dim * output_dim;  let s_b2 = output_dim;
+        let s_gamma = input_dim;             let s_beta = input_dim;
+        let s_z1 = batch_size * hidden_dim;  let s_ln_out = batch_size * input_dim;
+        let s_a1 = batch_size * hidden_dim;  let s_z2 = batch_size * output_dim;
+        let s_dz2 = batch_size * output_dim; let s_da1 = batch_size * hidden_dim;
+        let s_dln_out = batch_size * input_dim; let s_dz1 = batch_size * hidden_dim;
+        let s_dx = batch_size * input_dim;   let s_cache_mean = batch_size; let s_cache_var = batch_size;
+        let total_size = (s_w1 * 2) + (s_b1 * 2) + (s_w2 * 2) + (s_b2 * 2) + (s_gamma * 2) + (s_beta * 2) 
+            + s_z1 + s_ln_out + s_a1 + s_z2 + s_dz2 + s_da1 + s_dln_out + s_dz1 + s_dx + s_cache_mean + s_cache_var;
+        
+        // Allocate exactly ONE block of memory!
+        let pool = GPUMemory::new(total_size);
+        let mut offset = 0;
+        // A neat trick to dole out chunks of memory sequentially
+        let mut get = |size: usize| {
+            let view = pool.view(offset, size);
+            offset += size;
+            view
+        };
         Self {
-            w1: GPUMemory::new(input_dim * hidden_dim), b1: GPUMemory::new(hidden_dim),
-            w2: GPUMemory::new(hidden_dim * output_dim), b2: GPUMemory::new(output_dim),
-            gamma: GPUMemory::new(hidden_dim), beta: GPUMemory::new(hidden_dim),
+            w1: get(s_w1), b1: get(s_b1),
+            w2: get(s_w2), b2: get(s_b2),
+            gamma: get(s_gamma), beta: get(s_beta),
             
-            dw1: GPUMemory::new(input_dim * hidden_dim), db1: GPUMemory::new(hidden_dim),
-            dw2: GPUMemory::new(hidden_dim * output_dim), db2: GPUMemory::new(output_dim),
-            dgamma: GPUMemory::new(hidden_dim), dbeta: GPUMemory::new(hidden_dim),
+            dw1: get(s_w1), db1: get(s_b1),
+            dw2: get(s_w2), db2: get(s_b2),
+            dgamma: get(s_gamma), dbeta: get(s_beta),
             
-            z1: GPUMemory::new(batch_size * hidden_dim),
-            ln_out: GPUMemory::new(batch_size * hidden_dim),
-            a1: GPUMemory::new(batch_size * hidden_dim),
-            z2: GPUMemory::new(batch_size * output_dim),
+            z1: get(s_z1), ln_out: get(s_ln_out), a1: get(s_a1), z2: get(s_z2),
+            dz2: get(s_dz2), da1: get(s_da1), dln_out: get(s_dln_out),
+            dz1: get(s_dz1), dx: get(s_dx),
             
-            dz2: GPUMemory::new(batch_size * output_dim),
-            da1: GPUMemory::new(batch_size * hidden_dim),
-            dln_out: GPUMemory::new(batch_size * hidden_dim),
-            dz1: GPUMemory::new(batch_size * hidden_dim),
-            dx: GPUMemory::new(batch_size * input_dim),
-            
-            cache_mean: GPUMemory::new(batch_size),
-            cache_var: GPUMemory::new(batch_size),
+            cache_mean: get(s_cache_mean), cache_var: get(s_cache_var),
             
             batch_size, input_dim, hidden_dim, output_dim,
+            _pool: pool,
         }
     }
     pub fn initialize_parameters(&self) {
@@ -136,8 +153,8 @@ impl MLP {
         let host_b2 = vec![0.0; self.output_dim];
         
         // Phase 2: Gamma starts at 1.0 (no scaling), Beta starts at 0.0 (no shift)
-        let host_gamma = vec![1.0; self.hidden_dim];
-        let host_beta = vec![0.0; self.hidden_dim];
+        let host_gamma = vec![1.0; self.input_dim];
+        let host_beta = vec![0.0; self.input_dim];
         
         self.w1.copy_to_device(&host_w1);
         self.b1.copy_to_device(&host_b1);
@@ -149,14 +166,14 @@ impl MLP {
     // Forward Pass on GPU
     pub fn forward(&self, gpu_input: &GPUMemory) {
         unsafe {
-            // Layer 1: Z1 = X * W1 + B1
-            launch_matmul_forward(self.z1.ptr, gpu_input.ptr, self.w1.ptr, self.b1.ptr, self.batch_size as i32, self.input_dim as i32, self.hidden_dim as i32);
+            // Phase 2: LayerNorm (Normalizes input, applies Gamma/Beta, saves to LN_OUT)
+            launch_layernorm_forward(self.ln_out.ptr, self.cache_mean.ptr, self.cache_var.ptr, gpu_input.ptr, self.gamma.ptr, self.beta.ptr, self.batch_size as i32, self.input_dim as i32, 1e-5);
             
-            // Phase 2: LayerNorm (Normalizes Z1, applies Gamma/Beta, saves to LN_OUT)
-            launch_layernorm_forward(self.ln_out.ptr, self.cache_mean.ptr, self.cache_var.ptr, self.z1.ptr, self.gamma.ptr, self.beta.ptr, self.batch_size as i32, self.hidden_dim as i32, 1e-5);
+            // Layer 1: Z1 = LN_OUT * W1 + B1
+            launch_matmul_forward(self.z1.ptr, self.ln_out.ptr, self.w1.ptr, self.b1.ptr, self.batch_size as i32, self.input_dim as i32, self.hidden_dim as i32);
             
-            // Activation 1: A1 = max(0, LN_OUT)  <-- Notice we use LN_OUT now instead of Z1!
-            launch_relu_forward(self.a1.ptr, self.ln_out.ptr, (self.batch_size * self.hidden_dim) as i32);
+            // Activation 1: A1 = max(0, Z1)
+            launch_relu_forward(self.a1.ptr, self.z1.ptr, (self.batch_size * self.hidden_dim) as i32);
             
             // Layer 2: Z2 = A1 * W2 + B2 (logits)
             launch_matmul_forward(self.z2.ptr, self.a1.ptr, self.w2.ptr, self.b2.ptr, self.batch_size as i32, self.hidden_dim as i32, self.output_dim as i32);
@@ -170,20 +187,20 @@ impl MLP {
             launch_matmul_backward_bias(self.db2.ptr, self.dz2.ptr, self.batch_size as i32, self.output_dim as i32);
             launch_matmul_backward_input(self.da1.ptr, self.dz2.ptr, self.w2.ptr, self.batch_size as i32, self.hidden_dim as i32, self.output_dim as i32);
             
-            // 2. Backprop through ReLU (using LN_OUT instead of Z1)
-            launch_relu_backward(self.dln_out.ptr, self.da1.ptr, self.ln_out.ptr, (self.batch_size * self.hidden_dim) as i32);
+            // 2. Backprop through ReLU
+            launch_relu_backward(self.dz1.ptr, self.da1.ptr, self.z1.ptr, (self.batch_size * self.hidden_dim) as i32);
+            
+            // 3. Backprop through Layer 1
+            launch_matmul_backward_weight(self.dw1.ptr, self.ln_out.ptr, self.dz1.ptr, self.batch_size as i32, self.input_dim as i32, self.hidden_dim as i32);
+            launch_matmul_backward_bias(self.db1.ptr, self.dz1.ptr, self.batch_size as i32, self.hidden_dim as i32);
+            launch_matmul_backward_input(self.dln_out.ptr, self.dz1.ptr, self.w1.ptr, self.batch_size as i32, self.input_dim as i32, self.hidden_dim as i32);
             
             // Phase 2: Wipe Gamma/Beta blame scores to 0.0 before atomicAdd!
             self.dgamma.zero_memory();
             self.dbeta.zero_memory();
             
             // Phase 2: Backprop through LayerNorm
-            launch_layernorm_backward(self.dz1.ptr, self.dgamma.ptr, self.dbeta.ptr, self.dln_out.ptr, self.z1.ptr, self.cache_mean.ptr, self.cache_var.ptr, self.gamma.ptr, self.batch_size as i32, self.hidden_dim as i32, 1e-5);
-            
-            // 3. Backprop through Layer 1
-            launch_matmul_backward_weight(self.dw1.ptr, gpu_input.ptr, self.dz1.ptr, self.batch_size as i32, self.input_dim as i32, self.hidden_dim as i32);
-            launch_matmul_backward_bias(self.db1.ptr, self.dz1.ptr, self.batch_size as i32, self.hidden_dim as i32);
-            launch_matmul_backward_input(self.dx.ptr, self.dz1.ptr, self.w1.ptr, self.batch_size as i32, self.input_dim as i32, self.hidden_dim as i32);
+            launch_layernorm_backward(self.dx.ptr, self.dgamma.ptr, self.dbeta.ptr, self.dln_out.ptr, gpu_input.ptr, self.cache_mean.ptr, self.cache_var.ptr, self.gamma.ptr, self.batch_size as i32, self.input_dim as i32, 1e-5);
         }
     }
 }

@@ -77,7 +77,8 @@ unsafe extern "C"{
     pub fn gpu_free(device_ptr: *mut c_void);
     pub fn gpu_copy_to_device(device_dest: *mut c_void, host_src: *const c_void, size: usize);
     pub fn gpu_copy_to_host(host_dest: *mut c_void, device_src: *const c_void, size: usize);
-
+    pub fn cudaGetLastError() -> i32;
+    pub fn cudaGetErrorString(error: i32) -> *const std::os::raw::c_char;
     // CUDA kernel launcher wrappers
     pub fn launch_matmul_forward(
         out: *mut f32,
@@ -132,8 +133,12 @@ unsafe extern "C"{
     pub fn launch_adamw_step(
         param: *mut f32, m: *mut f32, v: *mut f32, grad: *const f32,
         lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32,
-        step: i32, size: i32,
+        step: i32, size: i32
     );
+
+    pub fn launch_attention_forward(Q: *const f32, K: *const f32, V: *const f32, Output: *mut f32, seq_len: i32, embed_dim: i32);
+    pub fn launch_cross_entropy(logits: *const f32, targets: *const i32, dlogits: *mut f32, loss_out: *mut f32, seq_len: i32, vocab_size: i32);
+    pub fn launch_attention_backward(dOutput: *const f32, Q: *const f32, K: *const f32, V: *const f32, dQ: *mut f32, dK: *mut f32, dV: *mut f32, seq_len: i32, embed_dim: i32);
     
     // Phase 2: Helper to zero out memory arrays on the GPU
     pub fn gpu_memset(device_ptr: *mut c_void, value: i32, size: usize);
@@ -157,6 +162,34 @@ unsafe extern "C"{
         batch_size: std::os::raw::c_int,
         hidden_dim: std::os::raw::c_int,
     );
+    pub fn attention_forward_kernel(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        output: *mut f32,
+        seq_len: std::os::raw::c_int,
+        embed_dim: std::os::raw::c_int,
+    );
+    pub fn attention_backward_kernel(
+        d_output: *const f32,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        dq: *mut f32,
+        dk: *mut f32,
+        dv: *mut f32,
+        seq_len: std::os::raw::c_int,
+        embed_dim: std::os::raw::c_int,
+    );
+    pub fn cross_entropy_kernel(
+        logits: *const f32,
+        targets: *const i32,
+        dlogits: *mut f32,
+        loss_out: *mut f32,
+        seq_len: std::os::raw::c_int,
+        vocab_size: std::os::raw::c_int,
+    );
+    pub fn launch_add_inplace(dest: *mut f32, src: *const f32, size: std::os::raw::c_int);
 }
 
 // ==========================================
@@ -166,17 +199,33 @@ unsafe extern "C"{
 pub struct GPUMemory {
     pub ptr: *mut f32, // Pointer to memory in GPU VRAM
     pub size: usize,   // Number of float elements allocated
+    pub owns_memory: bool, // NEW! Do we own this memory, or are we just a view?
 }
-
 impl GPUMemory {
     // Allocate memory on the GPU
     pub fn new(size: usize) -> Self {
         let byte_size = size * std::mem::size_of::<f32>();
         let ptr = unsafe { gpu_alloc(byte_size) as *mut f32 };
         if ptr.is_null() {
-            panic!("Failed to allocate {} bytes on GPU VRAM", byte_size);
+            unsafe {
+                let err_code = cudaGetLastError();
+                let err_ptr = cudaGetErrorString(err_code);
+                let err_str = std::ffi::CStr::from_ptr(err_ptr).to_string_lossy();
+                panic!("CUDA ERROR {}: {} (Failed to allocate {} bytes)", err_code, err_str, byte_size);
+            }
         }
-        Self { ptr, size }
+        Self { ptr, size, owns_memory: true }
+    }
+    // NEW! Create a sub-allocation (a view) into an existing pool!
+    pub fn view(&self, offset: usize, size: usize) -> Self {
+        if offset + size > self.size {
+            panic!("Memory View out of bounds!");
+        }
+        Self {
+            ptr: unsafe { self.ptr.add(offset) },
+            size,
+            owns_memory: false, // We do NOT free views! The main pool frees itself.
+        }
     }
 
     // Upload data from CPU (Host) to GPU (Device)
@@ -217,8 +266,10 @@ impl GPUMemory {
 // When a GPUMemory struct falls out of scope, free the VRAM automatically!
 impl Drop for GPUMemory {
     fn drop(&mut self) {
-        unsafe {
-            gpu_free(self.ptr as *mut c_void);
+        if self.owns_memory {
+            unsafe {
+                gpu_free(self.ptr as *mut c_void);
+            }
         }
     }
 }
